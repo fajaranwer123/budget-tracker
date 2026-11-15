@@ -1,12 +1,15 @@
-import { useRef } from "react"
+import { useEffect, useRef } from "react"
 import type { Budget } from "../types/budget.ts"
 import type { Category } from "../types/category.ts"
 import type { Expense, PaymentMethod } from "../types/expense.ts"
+import { createDefaultCategories } from "../utils/categories.ts"
+import { ALLOCATION_LIMIT_MESSAGE, exceedsBudget, sumAllocated } from "../utils/money.ts"
 import { useLocalStorage } from "./useLocalStorage.ts"
 
 const STORAGE_KEYS = {
   budget: "expense-tracker.budget",
   categories: "expense-tracker.categories",
+  categoriesSeeded: "expense-tracker.categories-seeded",
   expenses: "expense-tracker.expenses",
 } as const
 
@@ -91,9 +94,58 @@ function parseBudget(value: unknown): Budget | undefined {
   return isBudget(value) ? value : undefined
 }
 
+const PREVIOUS_DEFAULT_SEED: readonly (readonly [string, string])[] = [
+  ["cat-food", "Food"],
+  ["cat-transport", "Transport"],
+  ["cat-shopping", "Shopping"],
+  ["cat-bills", "Bills"],
+  ["cat-health", "Health"],
+  ["cat-other", "Other"],
+]
+
+function isUntouchedPreviousSeed(categories: Category[]): boolean {
+  if (categories.length !== PREVIOUS_DEFAULT_SEED.length) return false
+  return PREVIOUS_DEFAULT_SEED.every(([id, name]) =>
+    categories.some(
+      (category) => category.id === id && category.name === name && category.allocated === 0,
+    ),
+  )
+}
+
+function storedHasExpenses(): boolean {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEYS.expenses)
+    if (raw === null) return false
+    const parsed: unknown = JSON.parse(raw)
+    return Array.isArray(parsed) && parsed.length > 0
+  } catch {
+    return false
+  }
+}
+
+function categoriesWereSeeded(): boolean {
+  try {
+    return localStorage.getItem(STORAGE_KEYS.categoriesSeeded) === "1"
+  } catch {
+    return false
+  }
+}
+
+function markCategoriesSeeded(): void {
+  try {
+    localStorage.setItem(STORAGE_KEYS.categoriesSeeded, "1")
+  } catch {
+    // Ignore quota errors and private-mode storage failures.
+  }
+}
+
 function parseCategories(value: unknown): Category[] | undefined {
   if (!Array.isArray(value)) return undefined
-  return value.filter(isCategory)
+  const categories = value.filter(isCategory)
+  if (isUntouchedPreviousSeed(categories) && !storedHasExpenses()) return undefined
+  // An empty list from before defaults existed should still receive the seed.
+  if (categories.length === 0 && !categoriesWereSeeded()) return undefined
+  return categories
 }
 
 function parseExpenses(value: unknown): Expense[] | undefined {
@@ -109,6 +161,15 @@ function requireText(value: string, label: string): string {
 
 function requireMoney(value: number, label: string): void {
   if (!isNonNegative(value)) throw new Error(`${label} must be a non-negative number`)
+}
+
+function normalizeMoney(value: number, label: string): number {
+  if (!isNonNegative(value)) throw new Error(`${label} must be a non-negative number`)
+  return Math.round(value * 100) / 100
+}
+
+function assertWithinBudget(total: number, allocated: number): void {
+  if (exceedsBudget(total, allocated)) throw new Error(ALLOCATION_LIMIT_MESSAGE)
 }
 
 function validateBudget(budget: Budget): void {
@@ -133,16 +194,25 @@ function validateExpense(expense: Expense): void {
 
 export function useExpenseStore() {
   const [budget, setBudget] = useLocalStorage(STORAGE_KEYS.budget, createDefaultBudget, parseBudget)
-  const [categories, setCategories] = useLocalStorage(STORAGE_KEYS.categories, [], parseCategories)
+  const [categories, setCategories] = useLocalStorage(
+    STORAGE_KEYS.categories,
+    createDefaultCategories,
+    parseCategories,
+  )
   const [expenses, setExpenses] = useLocalStorage(STORAGE_KEYS.expenses, [], parseExpenses)
+
+  useEffect(() => {
+    markCategoriesSeeded()
+  }, [])
 
   const budgetRef = useRef(budget)
   const categoriesRef = useRef(categories)
   const expensesRef = useRef(expenses)
 
   function addBudget(input: BudgetInput): Budget {
-    const next: Budget = { total: input.total, month: input.month }
+    const next: Budget = { total: normalizeMoney(input.total, "Budget total"), month: input.month }
     validateBudget(next)
+    assertWithinBudget(next.total, sumAllocated(categoriesRef.current))
     budgetRef.current = next
     setBudget(next)
     return next
@@ -150,10 +220,14 @@ export function useExpenseStore() {
 
   function updateBudget(patch: BudgetUpdate): Budget {
     const next: Budget = {
-      total: patch.total ?? budgetRef.current.total,
+      total:
+        patch.total === undefined
+          ? budgetRef.current.total
+          : normalizeMoney(patch.total, "Budget total"),
       month: patch.month ?? budgetRef.current.month,
     }
     validateBudget(next)
+    assertWithinBudget(next.total, sumAllocated(categoriesRef.current))
     budgetRef.current = next
     setBudget(next)
     return next
@@ -161,6 +235,7 @@ export function useExpenseStore() {
 
   function deleteBudget(): Budget {
     const next = createDefaultBudget()
+    assertWithinBudget(next.total, sumAllocated(categoriesRef.current))
     budgetRef.current = next
     setBudget(next)
     return next
@@ -170,10 +245,14 @@ export function useExpenseStore() {
     const category: Category = {
       id: crypto.randomUUID(),
       name: requireText(input.name, "Category name"),
-      allocated: input.allocated,
+      allocated: normalizeMoney(input.allocated, "Allocated amount"),
       color: requireText(input.color, "Category color"),
     }
     validateCategory(category)
+    assertWithinBudget(
+      budgetRef.current.total,
+      sumAllocated(categoriesRef.current) + category.allocated,
+    )
     const next = [...categoriesRef.current, category]
     categoriesRef.current = next
     setCategories(next)
@@ -187,10 +266,17 @@ export function useExpenseStore() {
     const nextCategory: Category = {
       id: current.id,
       name: patch.name === undefined ? current.name : requireText(patch.name, "Category name"),
-      allocated: patch.allocated ?? current.allocated,
+      allocated:
+        patch.allocated === undefined
+          ? current.allocated
+          : normalizeMoney(patch.allocated, "Allocated amount"),
       color: patch.color === undefined ? current.color : requireText(patch.color, "Category color"),
     }
     validateCategory(nextCategory)
+    assertWithinBudget(
+      budgetRef.current.total,
+      sumAllocated(categoriesRef.current, id) + nextCategory.allocated,
+    )
 
     const next = categoriesRef.current.map((category) =>
       category.id === id ? nextCategory : category,
