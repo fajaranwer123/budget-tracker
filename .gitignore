@@ -1,6 +1,9 @@
 node_modules/
 .env
-.env.local
-.next/
+.env.*
+*.log
+.DS_Store
+__pycache__/
+venv/
 dist/
 build/
